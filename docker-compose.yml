@@ -1,0 +1,39 @@
+# Shared Nginx Gateway — routes traffic to ChainAlert + Verity Core
+#
+# Usage:
+#   docker compose up -d
+#
+# Both project deploy scripts create the "gateway" network idempotently.
+# Drop new *.conf files into nginx/conf.d/ to add more services.
+
+services:
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    networks:
+      - gateway
+
+networks:
+  gateway:
+    external: true

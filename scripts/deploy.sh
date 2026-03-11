@@ -3,12 +3,8 @@ set -euo pipefail
 
 # Gateway — Deploy Script (runs on EC2 via SSM)
 #
-# Copies nginx config to /opt/gateway, ensures certs exist,
+# Copies nginx config to /opt/gateway, fetches TLS certs from SSM,
 # creates the shared Docker network, and starts/reloads nginx.
-#
-# Certs are written by chainalert's deploy.sh (it fetches from SSM
-# and copies to /opt/gateway/certs/). On first gateway deploy before
-# chainalert, this script can fetch them directly from SSM.
 
 GATEWAY_DIR="/opt/gateway"
 REPO_DIR="$GATEWAY_DIR/repo"
@@ -51,33 +47,28 @@ echo "==> Syncing config files..."
 cp "$REPO_DIR/docker-compose.yml" "$GATEWAY_DIR/docker-compose.yml"
 cp -r "$REPO_DIR/nginx" "$GATEWAY_DIR/"
 
-# ── Ensure certs exist ────────────────────────────────────────────────────
+# ── Fetch TLS certs from SSM (always refresh) ────────────────────────────
 CERT_DIR="$GATEWAY_DIR/certs"
 mkdir -p "$CERT_DIR"
 
-if [ ! -f "$CERT_DIR/origin.pem" ] || [ ! -f "$CERT_DIR/origin-key.pem" ]; then
-  echo "==> No certs found — fetching from SSM..."
-  ORIGIN_CERT=$(aws ssm get-parameter \
-    --name "/chainalert/production/CLOUDFLARE_ORIGIN_CERT" \
-    --with-decryption --query "Parameter.Value" --output text \
-    --region "$REGION" 2>/dev/null || echo "")
+echo "==> Fetching TLS certs from SSM..."
+ORIGIN_CERT=$(aws ssm get-parameter \
+  --name "/chainalert/production/CLOUDFLARE_ORIGIN_CERT" \
+  --with-decryption --query "Parameter.Value" --output text \
+  --region "$REGION" 2>/dev/null || echo "")
 
-  ORIGIN_KEY=$(aws ssm get-parameter \
-    --name "/chainalert/production/CLOUDFLARE_ORIGIN_KEY" \
-    --with-decryption --query "Parameter.Value" --output text \
-    --region "$REGION" 2>/dev/null || echo "")
+ORIGIN_KEY=$(aws ssm get-parameter \
+  --name "/chainalert/production/CLOUDFLARE_ORIGIN_KEY" \
+  --with-decryption --query "Parameter.Value" --output text \
+  --region "$REGION" 2>/dev/null || echo "")
 
-  if [ -n "$ORIGIN_CERT" ] && [ -n "$ORIGIN_KEY" ]; then
-    echo "$ORIGIN_CERT" > "$CERT_DIR/origin.pem"
-    echo "$ORIGIN_KEY" > "$CERT_DIR/origin-key.pem"
-    chmod 600 "$CERT_DIR/origin-key.pem"
-    echo "==> TLS certs written from SSM."
-  else
-    echo "==> WARN: No certs in SSM. Gateway will start but HTTPS won't work"
-    echo "==>       until chainalert deploys and writes certs."
-  fi
+if [ -n "$ORIGIN_CERT" ] && [ -n "$ORIGIN_KEY" ]; then
+  echo "$ORIGIN_CERT" > "$CERT_DIR/origin.pem"
+  echo "$ORIGIN_KEY" > "$CERT_DIR/origin-key.pem"
+  chmod 600 "$CERT_DIR/origin-key.pem"
+  echo "==> TLS certs written."
 else
-  echo "==> TLS certs already present."
+  echo "==> WARN: No certs found in SSM. HTTPS won't work until certs are available."
 fi
 
 # ── Create shared Docker network ──────────────────────────────────────────

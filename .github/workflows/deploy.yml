@@ -42,7 +42,7 @@ jobs:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           aws ssm put-parameter \
-            --name "/chainalert/production/GH_APP_TOKEN" \
+            --name "/gateway/production/GH_APP_TOKEN" \
             --value "${GH_APP_TOKEN}" \
             --type SecureString \
             --overwrite > /dev/null

@@ -1,54 +1,101 @@
-# Gateway — Shared Nginx Reverse Proxy
+# Shared Infra
 
-Shared nginx gateway that routes traffic to multiple Docker Compose stacks on the same EC2 instance.
+Single Docker Compose stack that provides the **nginx gateway**, **shared
+postgres**, and **shared redis** for every app deployed on the Hetzner VPS.
+Apps bring only their own code — they reach the shared services over two
+external Docker networks.
+
+(The repo is still called `gateway` on GitHub; the project name inside
+compose is `shared`, and everything lives under `/opt/shared/` on the host.)
 
 ## Architecture
 
 ```
-Internet → Cloudflare → EC2:443 → gateway nginx
-                                    ├─ chainalert.dev      → chainalert stack
-                                    └─ verity.chainalert.dev → verity-core stack
+Internet → Cloudflare → VPS:443 → nginx (gateway network)
+                                    └─ sentinel.chainalert.dev → sentinel-api / sentinel-web
+
+                                  postgres (shared-infra network, alias "postgres")
+                                  redis    (shared-infra network, alias "redis")
+                                    ↑
+                                    └─ sentinel-api / sentinel-worker / ...
 ```
 
-All stacks join an external Docker network called `gateway`. Nginx uses Docker's embedded DNS resolver (`127.0.0.11`) with variables so it starts even if downstream services aren't deployed yet.
+Two external Docker networks, created idempotently by `scripts/deploy.sh`:
+
+- **`gateway`** — any app container that needs HTTPS routing via nginx.
+- **`shared-infra`** — any app container that needs postgres or redis.
+
+Nginx uses Docker's embedded DNS resolver (`127.0.0.11`) with variables in
+each `conf.d/*.conf` so it starts even when downstream apps are offline.
 
 ## Files
 
 ```
-docker-compose.yml          # nginx container, ports 80/443
+docker-compose.yml          # nginx + postgres + redis, project name "shared"
+.env.example                # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB / REDIS_PASSWORD
 nginx/
   nginx.conf                # main config, HTTP→HTTPS redirect, health check
   conf.d/
-    chainalert.conf         # chainalert.dev routing
-    verity.conf             # verity.chainalert.dev routing
-certs/                      # .gitignored — written by deploy scripts
+    sentinel.conf           # sentinel.chainalert.dev routing
+certs/                      # .gitignored — written by CI from SSM
   origin.pem
   origin-key.pem
 scripts/
-  deploy.sh                 # EC2 deploy script (run via SSM)
+  deploy.sh                 # host deploy script (runs on VPS via SSH)
+  backup-db.sh              # pg_dump a named DB to /opt/shared/backups
 ```
 
 ## Deployment
 
-Deploys automatically on push to `main` via GitHub Actions → SSM Send Command.
+Auto-deploys on push to `main` via GitHub Actions → SSH → `scripts/deploy.sh`.
 
 Manual deploy:
 ```bash
-ssh ec2-host "cd /opt/gateway/repo && bash scripts/deploy.sh"
+ssh deploy@vps "cd /opt/shared/repo && bash scripts/deploy.sh"
 ```
 
-## Adding a new service
+### Secrets (SSM, AWS region per workflow)
 
-1. Add a `conf.d/<service>.conf` with `server_name` and `proxy_pass` using resolver pattern
-2. In the service's `docker-compose.prod.yml`, join the `gateway` network with an alias
-3. Push to main — gateway redeploys and picks up the new config
+The deploy workflow reads from `/shared/production/*` and writes the
+rendered `.env` to `/opt/shared/.env` on the host.
 
-## Setup (new EC2 instance)
+| SSM parameter | Purpose |
+|---|---|
+| `/shared/production/POSTGRES_USER` | postgres superuser |
+| `/shared/production/POSTGRES_PASSWORD` | postgres superuser password |
+| `/shared/production/POSTGRES_DB` | default DB created on first init (existing volume already has multiple DBs) |
+| `/shared/production/REDIS_PASSWORD` | redis `--requirepass` |
+| `/shared/production/CLOUDFLARE_ORIGIN_CERT` | TLS cert PEM |
+| `/shared/production/CLOUDFLARE_ORIGIN_KEY` | TLS cert key PEM |
 
-The gateway repo needs the same GitHub App and AWS OIDC role used by chainalert. Required GitHub Actions secrets:
+GitHub Actions secrets: `APP_ID`, `APP_PRIVATE_KEY`, `AWS_ACCOUNT_ID`,
+`AWS_REGION`, `AWS_ROLE_NAME`, `HETZNER_HOST`, `HETZNER_USER`,
+`HETZNER_SSH_KEY`.
 
-- `APP_ID` / `APP_PRIVATE_KEY` — GitHub App for cloning private repos
-- `AWS_ACCOUNT_ID` / `AWS_REGION` — AWS account info
-- `EC2_INSTANCE_ID` — target EC2 instance
+## Onboarding a new app
 
-TLS certs are stored in SSM at `/chainalert/production/CLOUDFLARE_ORIGIN_CERT` and `CLOUDFLARE_ORIGIN_KEY`. The deploy script fetches them on first run if chainalert hasn't already written them to `/opt/gateway/certs/`.
+1. **App needs postgres/redis**: in its `docker-compose.prod.yml`, join the
+   `shared-infra` network (`external: true`). Reach postgres at
+   `postgres:5432` and redis at `redis:6379`. Create the app's database
+   once via:
+   ```bash
+   docker compose -f /opt/shared/docker-compose.yml exec postgres \
+     psql -U "$POSTGRES_USER" -c "CREATE DATABASE myapp;"
+   ```
+2. **App needs HTTPS routing**: join the `gateway` network with a stable
+   alias (e.g. `myapp-api`, `myapp-web`), then add a
+   `nginx/conf.d/myapp.conf` following the `resolver + set $var` pattern
+   from `sentinel.conf`. Push to `main`.
+3. **App needs SSM secrets**: store them at `/myapp/production/*` and have
+   the app's own deploy workflow fetch them. Do **not** add them to
+   `/shared/production/*` — that path is reserved for cross-app values.
+
+## Adding a new gateway route only
+
+Just drop `nginx/conf.d/<service>.conf` that proxies to the app container
+hostname. Push — the deploy script `cp`s the dir and reloads nginx.
+
+## Backups
+
+`scripts/backup-db.sh <db-name>` dumps a named database. Install the
+suggested crontab line on the VPS for each DB you want backed up.

@@ -1,4 +1,4 @@
-name: Deploy Gateway to Hetzner
+name: Deploy Shared Infra to Hetzner
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: deploy-gateway-hetzner
+  group: deploy-shared-hetzner
   cancel-in-progress: false
 
 permissions:
@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy Gateway to Hetzner
+    name: Deploy Shared Infra to Hetzner
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production
@@ -50,12 +50,55 @@ jobs:
       - name: Fetch TLS certs from SSM
         run: |
           aws ssm get-parameter \
-            --name "/chainalert/production/CLOUDFLARE_ORIGIN_CERT" \
+            --name "/shared/production/CLOUDFLARE_ORIGIN_CERT" \
             --with-decryption --query "Parameter.Value" --output text > origin.pem
 
           aws ssm get-parameter \
-            --name "/chainalert/production/CLOUDFLARE_ORIGIN_KEY" \
+            --name "/shared/production/CLOUDFLARE_ORIGIN_KEY" \
             --with-decryption --query "Parameter.Value" --output text > origin-key.pem
+
+      - name: Fetch secrets from SSM and build .env
+        run: |
+          set -euo pipefail
+          fetch_param() {
+            local name=$1 default=${2:-}
+            local value
+            if ! value=$(aws ssm get-parameter --name "$name" --with-decryption --query 'Parameter.Value' --output text 2>&1); then
+              if echo "$value" | grep -q "ParameterNotFound"; then
+                echo "::notice::SSM param not found: ${name}" >&2
+                value=$default
+              else
+                echo "::error::Failed to fetch ${name}: ${value}" >&2
+                exit 1
+              fi
+            fi
+            printf '%s' "$value"
+          }
+
+          POSTGRES_USER=$(fetch_param /shared/production/POSTGRES_USER)
+          POSTGRES_PASSWORD=$(fetch_param /shared/production/POSTGRES_PASSWORD)
+          POSTGRES_DB=$(fetch_param /shared/production/POSTGRES_DB)
+          REDIS_PASSWORD=$(fetch_param /shared/production/REDIS_PASSWORD)
+
+          MISSING=""
+          check_var() { eval "val=\$$1"; [ -z "$val" ] && MISSING="$MISSING $1($2)" || true; }
+          check_var POSTGRES_USER     /shared/production/POSTGRES_USER
+          check_var POSTGRES_PASSWORD /shared/production/POSTGRES_PASSWORD
+          check_var POSTGRES_DB       /shared/production/POSTGRES_DB
+          check_var REDIS_PASSWORD    /shared/production/REDIS_PASSWORD
+          if [ -n "$MISSING" ]; then
+            echo "::error::Required SSM parameters are empty — check these paths exist and the OIDC role can read them:$MISSING"
+            exit 1
+          fi
+
+          # Single-quote values so `source .env` is safe for special chars.
+          sq() { printf "%s='%s'\n" "$1" "${2//\'/\'\\\'\'}"; }
+          {
+            sq POSTGRES_USER     "$POSTGRES_USER"
+            sq POSTGRES_PASSWORD "$POSTGRES_PASSWORD"
+            sq POSTGRES_DB       "$POSTGRES_DB"
+            sq REDIS_PASSWORD    "$REDIS_PASSWORD"
+          } > /tmp/shared.env
 
       - name: Deploy
         env:
@@ -63,31 +106,32 @@ jobs:
           USER: ${{ secrets.HETZNER_USER }}
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          # Transfer TLS certs
-          ssh ${USER}@${HOST} "mkdir -p /opt/gateway/certs"
-          scp origin.pem origin-key.pem ${USER}@${HOST}:/opt/gateway/certs/
-          ssh ${USER}@${HOST} "chmod 600 /opt/gateway/certs/origin-key.pem"
-
-          # Ensure repo exists (first deploy)
+          # Ensure directories + repo exist (first deploy)
           ssh ${USER}@${HOST} "
-            if [ ! -d /opt/gateway/repo/.git ]; then
-              sudo mkdir -p /opt/gateway/repo && sudo chown -R deploy:deploy /opt/gateway
-              git clone 'https://x-access-token:${GH_APP_TOKEN}@github.com/OpSecWeb3/gateway.git' /opt/gateway/repo
+            if [ ! -d /opt/shared/repo/.git ]; then
+              sudo mkdir -p /opt/shared/repo /opt/shared/certs && sudo chown -R deploy:deploy /opt/shared
+              git clone 'https://x-access-token:${GH_APP_TOKEN}@github.com/OpSecWeb3/gateway.git' /opt/shared/repo
             fi
           "
 
+          # Transfer TLS certs + .env
+          scp origin.pem origin-key.pem ${USER}@${HOST}:/opt/shared/certs/
+          ssh ${USER}@${HOST} "chmod 600 /opt/shared/certs/origin-key.pem"
+          scp /tmp/shared.env ${USER}@${HOST}:/opt/shared/.env
+          ssh ${USER}@${HOST} "chmod 600 /opt/shared/.env"
+
           # Configure git auth temporarily for pull
           ssh ${USER}@${HOST} "
-            cd /opt/gateway/repo
+            cd /opt/shared/repo
             git remote set-url origin 'https://x-access-token:${GH_APP_TOKEN}@github.com/OpSecWeb3/gateway.git'
           "
 
           # Run deploy script
-          ssh ${USER}@${HOST} "cd /opt/gateway/repo && bash scripts/deploy.sh"
+          ssh ${USER}@${HOST} "cd /opt/shared/repo && bash scripts/deploy.sh"
 
           # Clear token from remote URL
           ssh ${USER}@${HOST} "
-            cd /opt/gateway/repo
+            cd /opt/shared/repo
             git remote set-url origin 'https://github.com/OpSecWeb3/gateway.git'
           "
 
@@ -97,4 +141,4 @@ jobs:
           HOST: ${{ secrets.HETZNER_HOST }}
           USER: ${{ secrets.HETZNER_USER }}
         run: |
-          ssh ${USER}@${HOST} "cd /opt/gateway && docker compose logs --tail=50 nginx" || true
+          ssh ${USER}@${HOST} "cd /opt/shared && docker compose logs --tail=50" || true

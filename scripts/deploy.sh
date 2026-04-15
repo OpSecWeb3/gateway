@@ -1,65 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Gateway — Deploy Script (Hetzner VPS)
+# Shared Infra — Deploy Script (Hetzner VPS)
 #
-# Called by the deploy workflow via SSH. Copies nginx config,
-# creates the shared Docker network, and starts/reloads nginx.
+# Called by the deploy workflow via SSH. Syncs config, ensures the shared
+# Docker networks exist, and starts/reloads the nginx + postgres + redis stack.
 #
-# TLS certs are delivered by CI pipeline (no SSM reads here).
+# Secrets (.env) and TLS certs are delivered by CI before this runs.
 
-GATEWAY_DIR="/opt/gateway"
-REPO_DIR="$GATEWAY_DIR/repo"
+SHARED_DIR="/opt/shared"
+REPO_DIR="$SHARED_DIR/repo"
 
 cd "$REPO_DIR"
 
-echo "==> Pulling latest gateway config..."
+echo "==> Pulling latest config..."
 git fetch origin main
 git checkout main
 git reset --hard origin/main
 
-# ── Copy config files to /opt/gateway ──────────────────────────────────────
+# ── Sync config files to /opt/shared ───────────────────────────────────────
 echo "==> Syncing config files..."
-cp "$REPO_DIR/docker-compose.yml" "$GATEWAY_DIR/docker-compose.yml"
-cp -r "$REPO_DIR/nginx" "$GATEWAY_DIR/"
+cp "$REPO_DIR/docker-compose.yml" "$SHARED_DIR/docker-compose.yml"
+rm -rf "$SHARED_DIR/nginx"
+cp -r "$REPO_DIR/nginx" "$SHARED_DIR/"
 
-# ── TLS certs are delivered by CI pipeline to /opt/gateway/certs/ ────────
-CERT_DIR="$GATEWAY_DIR/certs"
+# ── Ensure .env is present (delivered by CI) ──────────────────────────────
+if [ ! -f "$SHARED_DIR/.env" ]; then
+  echo "ERROR: .env not found in $SHARED_DIR. CI should have delivered it."
+  exit 1
+fi
+
+# Load creds for health checks below.
+# shellcheck disable=SC1091
+set -a; . "$SHARED_DIR/.env"; set +a
+
+# ── TLS certs (delivered by CI to /opt/shared/certs/) ─────────────────────
+CERT_DIR="$SHARED_DIR/certs"
 if [ ! -f "$CERT_DIR/origin.pem" ] || [ ! -f "$CERT_DIR/origin-key.pem" ]; then
   echo "==> WARN: TLS certs not found in $CERT_DIR. HTTPS won't work until certs are available."
 fi
 
-# ── Create shared Docker network ──────────────────────────────────────────
-echo "==> Ensuring gateway network exists..."
+# ── Ensure external Docker networks exist ─────────────────────────────────
+echo "==> Ensuring shared networks exist..."
 docker network create gateway 2>/dev/null || true
+docker network create shared-infra 2>/dev/null || true
 
-# ── Start or reload nginx ─────────────────────────────────────────────────
-cd "$GATEWAY_DIR"
+cd "$SHARED_DIR"
 
-if docker compose ps --status running nginx 2>/dev/null | grep -q nginx; then
-  echo "==> Nginx is running — testing config and reloading..."
-  docker compose exec -T nginx nginx -t
-  docker compose exec -T nginx nginx -s reload
+# ── Start or reload the stack ─────────────────────────────────────────────
+echo "==> Bringing up shared stack..."
+docker compose up -d --remove-orphans
+
+# Reload nginx config in place (picks up conf.d edits without dropping conns).
+if docker compose exec -T nginx nginx -t 2>/dev/null; then
+  docker compose exec -T nginx nginx -s reload || true
   echo "==> Nginx reloaded."
-else
-  echo "==> Starting nginx..."
-  docker compose up -d
-  echo "==> Nginx started."
 fi
 
-# ── Health check ──────────────────────────────────────────────────────────
-echo "==> Checking nginx health..."
-TRIES=0
-MAX_TRIES=10
-until curl -sf http://localhost/nginx-health > /dev/null 2>&1; do
-  TRIES=$((TRIES + 1))
-  if [ "$TRIES" -ge "$MAX_TRIES" ]; then
-    echo "ERROR: Nginx health check failed after ${MAX_TRIES}s"
-    docker compose logs --tail=20 nginx
-    exit 1
-  fi
-  sleep 1
-done
+# ── Health checks ─────────────────────────────────────────────────────────
+wait_for() {
+  local name=$1; shift
+  local tries=0 max=15
+  until "$@" > /dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge "$max" ]; then
+      echo "ERROR: ${name} health check failed after ${max} attempts"
+      docker compose logs --tail=20 "$name" || true
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "==> ${name} is healthy."
+}
 
-echo "==> Nginx is healthy."
-echo "==> Gateway deploy complete."
+echo "==> Checking nginx health..."
+wait_for nginx curl -sf http://localhost/nginx-health
+
+echo "==> Checking postgres health..."
+wait_for postgres docker compose exec -T postgres pg_isready -U "$POSTGRES_USER"
+
+echo "==> Checking redis health..."
+wait_for redis docker compose exec -T redis redis-cli -a "$REDIS_PASSWORD" ping
+
+echo "==> Shared infra deploy complete."
+docker compose ps
